@@ -5,7 +5,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type AdjustRow } from '@/utils/db'
+import { createId, db, type AdjustRow } from '@/utils/db'
 import {
   ADJUST_STATE_FLOW,
   type Adjust,
@@ -22,6 +22,20 @@ export interface AdjustEnriched {
   /** 生成调节单时的失衡度快照（按最新实测重算） */
   imbalanceValue: number
   level: BalanceLevel
+}
+
+/** 勾选批量派单的入参：目标开度与依据均取自失衡度排行的最新实测 */
+export interface BatchDispatchItem {
+  valve: Valve
+  targetOpening: number
+  basis: string
+}
+
+export interface BatchDispatchResult {
+  /** 覆盖已有「待下发」单的数量 */
+  overwritten: number
+  /** 保留历史单后新开的数量 */
+  created: number
 }
 
 export const useAdjustStore = defineStore('adjust', () => {
@@ -171,6 +185,49 @@ export const useAdjustStore = defineStore('adjust', () => {
     return payload.length
   }
 
+  /**
+   * 勾选失衡阀门批量生成待下发调节单：
+   * - 已有「待下发」单 → 用最新实测的建议开度与依据直接覆盖，不重复开单
+   * - 已有「已调节 / 已复核」单 → 保留历史执行记录，另开一张待下发单
+   * 整个批次在同一事务内逐条写入（事务内现查现判，避免快照过期误判）；
+   * 任一阀门写入失败即整体回滚，并抛出带阀门编号的错误
+   */
+  async function generateBatch(items: BatchDispatchItem[]): Promise<BatchDispatchResult> {
+    const now = Date.now()
+    const result: BatchDispatchResult = { overwritten: 0, created: 0 }
+    await db.transaction('rw', db.adjusts, async () => {
+      for (const item of items) {
+        const targetOpening = Math.min(100, Math.max(0, Math.round(item.targetOpening)))
+        const basis = item.basis.trim()
+        try {
+          const existing = await db.adjusts.where('valveId').equals(item.valve.id).toArray()
+          const pending = existing.find((adjust) => adjust.state === '待下发')
+          if (pending) {
+            await db.adjusts.update(pending.id, { targetOpening, basis, updatedAt: now })
+            result.overwritten += 1
+          } else {
+            await db.adjusts.put({
+              id: createId('aj'),
+              valveId: item.valve.id,
+              targetOpening,
+              basis,
+              executor: '待指派',
+              state: '待下发',
+              reviewNote: '',
+              createdAt: now,
+              updatedAt: now
+            })
+            result.created += 1
+          }
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : '未知错误'
+          throw new Error(`阀门 ${item.valve.code} 写入失败（${reason}）`)
+        }
+      }
+    })
+    return result
+  }
+
   return {
     adjustTable,
     adjusts,
@@ -190,6 +247,7 @@ export const useAdjustStore = defineStore('adjust', () => {
     removeAdjust,
     advance,
     review,
-    generateFromRank
+    generateFromRank,
+    generateBatch
   }
 })
