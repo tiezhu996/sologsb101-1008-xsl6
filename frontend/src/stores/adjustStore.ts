@@ -5,7 +5,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type AdjustRow } from '@/utils/db'
+import { createId, db, ROW_REVISION, type AdjustRow } from '@/utils/db'
 import {
   ADJUST_STATE_FLOW,
   type Adjust,
@@ -22,6 +22,35 @@ export interface AdjustEnriched {
   /** 生成调节单时的失衡度快照（按最新实测重算） */
   imbalanceValue: number
   level: BalanceLevel
+}
+
+/** 由失衡度排行灌入的批量派单数据（沿用排行的最新实测、建议开度与依据） */
+export interface RankAdjustDraft {
+  valve: Valve
+  /** 排行按最新实测给出的判级，平衡阀门不派单 */
+  level: BalanceLevel
+  suggestOpening: number
+  basisText: string
+}
+
+export interface BatchGenerateResult {
+  /** 实际处理的失衡阀门数（平衡项不计入） */
+  total: number
+  /** 覆盖的待下发原单数 */
+  overwritten: number
+  /** 保留历史后新开的单数 */
+  created: number
+}
+
+/** 批量写入中途失败：事务整体回滚，failedValveCode 标记首个写入失败的阀门 */
+export class BatchAdjustError extends Error {
+  failedValveCode: string
+  constructor(failedValveCode: string, cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : '本地写入失败'
+    super(`阀门 ${failedValveCode} 调节单写入失败：${reason}`)
+    this.name = 'BatchAdjustError'
+    this.failedValveCode = failedValveCode
+  }
 }
 
 export const useAdjustStore = defineStore('adjust', () => {
@@ -103,6 +132,10 @@ export const useAdjustStore = defineStore('adjust', () => {
 
   const hasAdjust = (valveId: string): boolean => adjusts.value.some((adjust) => adjust.valveId === valveId)
 
+  /** 该阀门当前待下发单（用于判断派单时是覆盖还是保留历史新开）；无则返回 null */
+  const pendingOf = (valveId: string): AdjustRow | null =>
+    adjusts.value.find((adjust) => adjust.valveId === valveId && adjust.state === '待下发') ?? null
+
   async function createAdjust(draft: AdjustDraft): Promise<AdjustRow> {
     return (await adjustTable.create(
       {
@@ -148,27 +181,82 @@ export const useAdjustStore = defineStore('adjust', () => {
     await adjustTable.update(id, { state: '已复核', reviewNote: note.trim() || '复核合格' })
   }
 
-  /** 由失衡度排行批量生成调节单 */
-  async function generateFromRank(
-    rows: Array<{ valve: Valve; measured: number; roomTempC: number; imbalanceValue: number; level: BalanceLevel; suggestOpening: number; basisText: string }>
-  ): Promise<number> {
+  /**
+   * 按排行勾选结果批量生成待下发调节单（单事务原子写入）。
+   * 决策口径（依据排行最新实测对应的既有调节单状态）：
+   * - 该阀门存在「待下发」单：直接覆盖原单（保留 id，更新目标开度/依据，重置执行人与复核意见），
+   *   不新开，避免同一阀门出现两张待下发单；
+   * - 仅存在「已调节 / 已复核」单：保留全部历史记录，另开一张待下发单。
+   * 任一条写入失败时事务回滚，前面的修改一并撤回，并抛出携带失败阀门编号的 BatchAdjustError。
+   */
+  async function batchDispatchFromRank(drafts: RankAdjustDraft[]): Promise<BatchGenerateResult> {
+    const target = drafts.filter((draft) => draft.level !== '平衡')
+
+    const result: BatchGenerateResult = { total: target.length, overwritten: 0, created: 0 }
+
+    if (target.length === 0) return result
+
     const now = Date.now()
-    const payload: AdjustRow[] = rows
-      .filter((row) => row.level === '严重失衡' || row.level === '偏大' || row.level === '偏小')
-      .filter((row) => !hasAdjust(row.valve.id))
-      .map((row, index) => ({
-        id: `aj_${now.toString(36)}${index}${Math.random().toString(36).slice(2, 5)}`,
-        valveId: row.valve.id,
-        targetOpening: row.suggestOpening,
-        basis: row.basisText,
-        executor: '待指派',
-        state: '待下发' as AdjustState,
-        reviewNote: '',
-        createdAt: now,
-        updatedAt: now
-      }))
-    if (payload.length > 0) await db.adjusts.bulkPut(payload)
-    return payload.length
+    try {
+      await db.transaction('rw', db.adjusts, async () => {
+        const existing = await db.adjusts.toArray()
+        const byValve = new Map<string, AdjustRow[]>()
+        existing.forEach((adjust) => {
+          const group = byValve.get(adjust.valveId)
+          if (group) group.push(adjust)
+          else byValve.set(adjust.valveId, [adjust])
+        })
+
+        await Promise.all(
+          target.map(async (draft) => {
+            try {
+              const own = byValve.get(draft.valve.id) ?? []
+              const pending = own.filter((adjust) => adjust.state === '待下发')
+              const fields = {
+                targetOpening: Math.min(100, Math.max(20, Math.round(draft.suggestOpening))),
+                basis: draft.basisText.trim(),
+                executor: '待指派',
+                state: '待下发' as AdjustState,
+                reviewNote: ''
+              }
+
+              if (pending.length > 0) {
+                // 覆盖最早一张待下发单；同阀若存在重复待下发单，删除多余项，保证至多一张
+                const [primary, ...duplicates] = pending.sort((a, b) => a.createdAt - b.createdAt)
+                await db.adjusts.put({
+                  ...primary,
+                  ...fields,
+                  createdAt: primary.createdAt,
+                  updatedAt: now,
+                  revision: ROW_REVISION
+                })
+                if (duplicates.length > 0) await db.adjusts.bulkDelete(duplicates.map((item) => item.id))
+                result.overwritten += 1
+              } else {
+                // 已调节 / 已复核历史全部保留，另开新单
+                await db.adjusts.put({
+                  id: createId('aj'),
+                  valveId: draft.valve.id,
+                  ...fields,
+                  createdAt: now,
+                  updatedAt: now,
+                  revision: ROW_REVISION
+                })
+                result.created += 1
+              }
+            } catch (cause) {
+              // 标记实际写入失败的阀门；事务会随异常整体回滚
+              throw new BatchAdjustError(draft.valve.code, cause)
+            }
+          })
+        )
+      })
+    } catch (error) {
+      if (error instanceof BatchAdjustError) throw error
+      throw new BatchAdjustError(target[0]?.valve.code ?? '未知阀门', error)
+    }
+
+    return result
   }
 
   return {
@@ -185,11 +273,12 @@ export const useAdjustStore = defineStore('adjust', () => {
     patchFilter,
     resetFilter,
     hasAdjust,
+    pendingOf,
     createAdjust,
     updateAdjust,
     removeAdjust,
     advance,
     review,
-    generateFromRank
+    batchDispatchFromRank
   }
 })

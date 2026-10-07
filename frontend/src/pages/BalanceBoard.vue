@@ -4,7 +4,7 @@
  * 按流量比、室温偏差合成失衡度并降序排列，可一键生成调节单。
  * 消费 Valve、Measure；复用 <BalanceTag>、<StatBadge>、<EmptyPanel>。
  */
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
@@ -14,7 +14,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import { useImbalanceRank, type ImbalanceRow } from '@/hooks/useImbalanceRank'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
-import { useAdjustStore } from '@/stores/adjustStore'
+import { useAdjustStore, BatchAdjustError } from '@/stores/adjustStore'
 import { IMBALANCE_BALANCED, IMBALANCE_WARN, basisText, formatFlow, formatOpening } from '@/utils/balance'
 import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
 import { exportBalanceCsv } from '@/utils/export'
@@ -57,6 +57,7 @@ const rows = computed<ImbalanceRow[]>(() =>
 )
 
 const columns = [
+  { colKey: 'row-select', type: 'multiple' as const, width: 48 },
   { colKey: 'rank', title: '排名', width: 70, cell: 'rankCell' },
   { colKey: 'where', title: '换热站 / 楼栋', width: 200, cell: 'whereCell' },
   { colKey: 'code', title: '阀门编号', width: 130, cell: 'codeCell' },
@@ -68,6 +69,15 @@ const columns = [
   { colKey: 'suggest', title: '建议开度', width: 110, cell: 'suggestCell' },
   { colKey: 'op', title: '操作', width: 170, cell: 'opCell' }
 ]
+
+/** 勾选范围只针对当前筛选结果；筛选变化后清掉已不在结果内的勾选项 */
+const selectedRowKeys = ref<string[]>([])
+watch(rows, (list) => {
+  const visibleIds = new Set(list.map((row) => row.valve.id))
+  if (selectedRowKeys.value.some((id) => !visibleIds.has(id))) {
+    selectedRowKeys.value = selectedRowKeys.value.filter((id) => visibleIds.has(id))
+  }
+})
 
 function rowKey(row: ImbalanceRow): string {
   return row.valve.id
@@ -85,24 +95,39 @@ function describe(row: ImbalanceRow): string {
   })
 }
 
+/** 沿用排行里的最新实测、建议开度与依据组装派单数据 */
+function toDraft(row: ImbalanceRow) {
+  return {
+    valve: row.valve,
+    level: row.level,
+    suggestOpening: row.suggestOpening,
+    basisText: describe(row)
+  }
+}
+
+/** 单条派单按钮文案：有待下发单则覆盖；仅有已调节/已复核历史则重派（保留历史新开） */
+function dispatchLabel(row: ImbalanceRow): string {
+  if (row.level === '平衡') return '无需调节'
+  if (adjustStore.pendingOf(row.valve.id)) return '覆盖待下发单'
+  if (adjustStore.hasAdjust(row.valve.id)) return '重新派单'
+  return '生成调节单'
+}
+
 async function generateOne(row: ImbalanceRow): Promise<void> {
   if (row.level === '平衡') {
     MessagePlugin.info(`${row.valve.code} 处于平衡区间，无需下发调节单`)
     return
   }
-  if (adjustStore.hasAdjust(row.valve.id)) {
-    MessagePlugin.info(`${row.valve.code} 已存在调节单，请到调节单页处理`)
-    return
+  try {
+    const result = await adjustStore.batchDispatchFromRank([toDraft(row)])
+    if (result.overwritten > 0) {
+      MessagePlugin.success(`已按最新实测覆盖 ${row.valve.code} 的待下发调节单，目标开度 ${row.suggestOpening}%`)
+    } else {
+      MessagePlugin.success(`已为 ${row.valve.code} 生成待下发调节单，目标开度 ${row.suggestOpening}%`)
+    }
+  } catch (error) {
+    MessagePlugin.error(error instanceof BatchAdjustError ? error.message : `${row.valve.code} 调节单写入失败`)
   }
-  await adjustStore.createAdjust({
-    valveId: row.valve.id,
-    targetOpening: row.suggestOpening,
-    basis: describe(row),
-    executor: '待指派',
-    state: '待下发',
-    reviewNote: ''
-  })
-  MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%`)
 }
 
 /* --------------------------- 调节单维护 --------------------------- */
@@ -151,24 +176,35 @@ function removeAdjust(row: ImbalanceRow): void {
   })
 }
 
-async function generateAll(): Promise<void> {
-  const payload = rank.rows.value
-    .filter((row) => row.latest !== null && row.level !== '平衡')
-    .map((row) => ({
-      valve: row.valve,
-      measured: row.measured,
-      roomTempC: row.latest ? row.latest.roomTempC : 20,
-      imbalanceValue: row.imbalanceValue,
-      level: row.level,
-      suggestOpening: row.suggestOpening,
-      basisText: describe(row)
-    }))
-  const count = await adjustStore.generateFromRank(payload)
-  if (count === 0) {
-    MessagePlugin.info('没有新的失衡阀门需要生成调节单')
+/**
+ * 批量派单：仅处理当前筛选结果中勾选的失衡阀门。
+ * 覆盖 / 新开由 store 按既有调节单状态决定；任一阀门写入失败时整批回滚。
+ */
+async function generateSelected(): Promise<void> {
+  const selectedRows = rows.value.filter((row) => selectedRowKeys.value.includes(row.valve.id))
+  if (selectedRows.length === 0) {
+    MessagePlugin.info('请先勾选需要派单的失衡阀门')
     return
   }
-  MessagePlugin.success(`已批量生成 ${count} 张调节单`)
+  const skipped = selectedRows.filter((row) => row.level === '平衡').length
+  const drafts = selectedRows.filter((row) => row.level !== '平衡').map(toDraft)
+  if (drafts.length === 0) {
+    MessagePlugin.info('勾选的阀门均处于平衡区间，无需下发调节单')
+    return
+  }
+  try {
+    const result = await adjustStore.batchDispatchFromRank(drafts)
+    const detail = `覆盖待下发原单 ${result.overwritten} 张，保留历史后新开 ${result.created} 张`
+    const skipTip = skipped > 0 ? `；已跳过 ${skipped} 只平衡阀门` : ''
+    MessagePlugin.success(`已批量生成 ${result.total} 张待下发调节单（${detail}${skipTip}）`)
+    selectedRowKeys.value = []
+  } catch (error) {
+    if (error instanceof BatchAdjustError) {
+      MessagePlugin.error(`批量派单失败，已撤回全部修改。${error.message}`)
+    } else {
+      MessagePlugin.error('批量派单失败，已撤回全部修改')
+    }
+  }
 }
 
 function exportCsv(): void {
@@ -209,7 +245,13 @@ function goAdjust(): void {
       </div>
       <div class="page-head__actions">
         <t-button variant="outline" @click="exportCsv">导出失衡度 CSV</t-button>
-        <t-button variant="outline" @click="generateAll">一键生成调节单</t-button>
+        <t-button
+          variant="outline"
+          :disabled="selectedRowKeys.length === 0"
+          @click="generateSelected"
+        >
+          批量生成待下发单{{ selectedRowKeys.length > 0 ? `（${selectedRowKeys.length}）` : '' }}
+        </t-button>
         <t-button theme="primary" @click="goAdjust">前往调节单（{{ adjustStore.stateCounts['待下发'] }}）</t-button>
       </div>
     </div>
@@ -253,7 +295,16 @@ function goAdjust(): void {
         @secondary="valveStore.patchFilter({ onlyImbalanced: false })"
       />
 
-      <t-table v-else :data="rows" :columns="columns" :row-key="rowKey" bordered stripe size="small">
+      <t-table
+        v-else
+        v-model:selected-row-keys="selectedRowKeys"
+        :data="rows"
+        :columns="columns"
+        :row-key="rowKey"
+        bordered
+        stripe
+        size="small"
+      >
         <template #rankCell="{ rowIndex }">{{ rowIndex + 1 }}</template>
         <template #whereCell="{ row }">
           {{ row.station ? row.station.name : '—' }} / {{ row.building ? row.building.name : '—' }}
@@ -287,10 +338,10 @@ function goAdjust(): void {
               size="small"
               variant="text"
               theme="primary"
-              :disabled="row.level === '平衡' || adjustStore.hasAdjust(row.valve.id)"
+              :disabled="row.level === '平衡'"
               @click="generateOne(row)"
             >
-              {{ adjustStore.hasAdjust(row.valve.id) ? '已派单' : '生成调节单' }}
+              {{ dispatchLabel(row) }}
             </t-button>
             <t-button
               size="small"
